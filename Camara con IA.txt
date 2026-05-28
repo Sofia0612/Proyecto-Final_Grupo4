@@ -1,0 +1,1202 @@
+#!/usr/bin/env python3
+
+from picamera2 import Picamera2
+import cv2
+import numpy as np
+import time
+import argparse
+import os
+from datetime import datetime
+
+try:
+    from gpiozero import DigitalOutputDevice, PWMOutputDevice
+except ImportError:
+    DigitalOutputDevice = None
+    PWMOutputDevice = None
+
+
+VENTANA = "Detector IA - Maiz Peto"
+MODELO_DEFAULT = "modelo_maiz_peto.npz"
+
+
+class MotorPuenteH:
+    """
+    Control de un motor DC con puente H.
+
+    Pines:
+    - IN1
+    - IN2
+    - EN opcional
+
+    Si usas EN, se maneja con PWMOutputDevice para permitir velocidad 0.0 a 1.0.
+    Si no usas EN, ejecuta con --banda-sin-en o --piston-sin-en.
+    """
+
+    def __init__(
+        self,
+        pin_in1,
+        pin_in2,
+        pin_en=None,
+        velocidad=1.0,
+        invertido=False,
+        en_active_high=True,
+        nombre="motor"
+    ):
+        if DigitalOutputDevice is None or PWMOutputDevice is None:
+            raise RuntimeError(
+                "No se pudo importar gpiozero. Instala con: "
+                "sudo apt install python3-gpiozero python3-lgpio"
+            )
+
+        self.nombre = nombre
+        self.invertido = invertido
+        self.velocidad = max(0.0, min(float(velocidad), 1.0))
+
+        self.in1 = DigitalOutputDevice(
+            pin_in1,
+            active_high=True,
+            initial_value=False
+        )
+
+        self.in2 = DigitalOutputDevice(
+            pin_in2,
+            active_high=True,
+            initial_value=False
+        )
+
+        self.en = None
+
+        if pin_en is not None and int(pin_en) >= 0:
+            self.en = PWMOutputDevice(
+                int(pin_en),
+                active_high=en_active_high,
+                initial_value=0.0,
+                frequency=1000
+            )
+
+        self.detener(freno=False)
+
+    def set_velocidad(self, velocidad):
+        self.velocidad = max(0.0, min(float(velocidad), 1.0))
+
+    def _enable_off(self):
+        if self.en is not None:
+            self.en.value = 0.0
+
+    def _enable_on(self):
+        if self.en is not None:
+            self.en.value = self.velocidad
+
+    def mover(self, sentido):
+        """
+        sentido = 1  -> adelante
+        sentido = -1 -> reversa
+        sentido = 0  -> detener
+        """
+
+        if sentido == 0:
+            self.detener()
+            return
+
+        if self.invertido:
+            sentido = -sentido
+
+        # Apagar EN antes de cambiar direccion para reducir golpes electricos.
+        self._enable_off()
+        self.in1.off()
+        self.in2.off()
+
+        time.sleep(0.02)
+
+        if sentido > 0:
+            self.in1.on()
+            self.in2.off()
+            direccion = "adelante"
+        else:
+            self.in1.off()
+            self.in2.on()
+            direccion = "reversa"
+
+        self._enable_on()
+
+        print(f"GPIO: {self.nombre} {direccion}.")
+
+    def detener(self, freno=False):
+        """
+        freno=False:
+            IN1=OFF, IN2=OFF, EN=OFF si existe.
+
+        freno=True:
+            IN1=ON, IN2=ON, EN=velocidad si existe.
+            En muchos puentes H esto aplica freno electrico.
+            Pruebalo con cuidado porque depende del driver.
+        """
+
+        if freno:
+            self.in1.on()
+            self.in2.on()
+            self._enable_on()
+            print(f"GPIO: {self.nombre} detenido con freno.")
+        else:
+            self._enable_off()
+            self.in1.off()
+            self.in2.off()
+            print(f"GPIO: {self.nombre} detenido.")
+
+    def apagar(self):
+        try:
+            self.detener(freno=False)
+        finally:
+            for dev in [self.en, self.in1, self.in2]:
+                if dev is not None:
+                    try:
+                        dev.close()
+                    except Exception:
+                        pass
+
+
+class ControlActuadoresHBridge:
+    """
+    Controla dos puentes H:
+
+    1. Motor de la banda transportadora.
+    2. Motor del piston/actuador de rechazo.
+
+    Secuencia ante alerta:
+    - Espera retardo_rechazo segundos.
+    - Detiene banda.
+    - Extiende piston.
+    - Detiene piston.
+    - Retrae piston.
+    - Detiene piston.
+    - Reanuda banda, salvo que uses --no-reanudar-banda.
+    """
+
+    def __init__(
+        self,
+        banda_in1=17,
+        banda_in2=27,
+        banda_en=22,
+        piston_in1=5,
+        piston_in2=6,
+        piston_en=13,
+        velocidad_banda=1.0,
+        velocidad_piston=1.0,
+        banda_invertir=False,
+        piston_invertir=False,
+        banda_en_active_high=True,
+        piston_en_active_high=True,
+        retardo_rechazo=2.0,
+        tiempo_extender=0.7,
+        pausa_extendido=0.1,
+        tiempo_retraer=0.7,
+        tiempo_rearme=1.0,
+        cooldown=3.0,
+        reanudar=True,
+        freno_banda=False,
+        freno_piston=False
+    ):
+        self.banda = MotorPuenteH(
+            pin_in1=banda_in1,
+            pin_in2=banda_in2,
+            pin_en=banda_en,
+            velocidad=velocidad_banda,
+            invertido=banda_invertir,
+            en_active_high=banda_en_active_high,
+            nombre="banda"
+        )
+
+        self.piston = MotorPuenteH(
+            pin_in1=piston_in1,
+            pin_in2=piston_in2,
+            pin_en=piston_en,
+            velocidad=velocidad_piston,
+            invertido=piston_invertir,
+            en_active_high=piston_en_active_high,
+            nombre="piston"
+        )
+
+        self.retardo_rechazo = retardo_rechazo
+        self.tiempo_extender = tiempo_extender
+        self.pausa_extendido = pausa_extendido
+        self.tiempo_retraer = tiempo_retraer
+        self.tiempo_rearme = tiempo_rearme
+        self.cooldown = cooldown
+        self.reanudar = reanudar
+        self.freno_banda = freno_banda
+        self.freno_piston = freno_piston
+
+        self.estado = "detenido"
+
+        self.t_alerta = 0.0
+        self.t_extender = 0.0
+        self.t_pausa = 0.0
+        self.t_retraer = 0.0
+        self.t_rearme = 0.0
+
+        self.ultimo_disparo = 0.0
+
+        self.piston.detener(freno=False)
+        self.banda.detener(freno=False)
+
+    def iniciar_banda(self):
+        self.piston.detener(freno=False)
+        self.banda.mover(1)
+        self.estado = "corriendo"
+        print("GPIO: banda encendida.")
+
+    def registrar_alerta(self):
+        """
+        Registra una alerta nueva solo si la banda esta corriendo.
+        Mientras el piston esta actuando, ignora nuevas alertas.
+        """
+
+        ahora = time.time()
+
+        if self.estado != "corriendo":
+            return
+
+        if ahora - self.ultimo_disparo < self.cooldown:
+            return
+
+        self.estado = "esperando_rechazo"
+        self.t_alerta = ahora
+
+        print("")
+        print("GPIO: alerta detectada.")
+        print(f"GPIO: esperando {self.retardo_rechazo:.2f} segundos antes de parar banda.")
+        print("")
+
+    def actualizar(self):
+        """
+        Maquina de estados no bloqueante.
+        Debe llamarse en cada vuelta del while principal.
+        """
+
+        ahora = time.time()
+
+        if self.estado == "esperando_rechazo":
+            if ahora - self.t_alerta >= self.retardo_rechazo:
+                self.banda.detener(freno=self.freno_banda)
+                self.piston.mover(1)
+
+                self.t_extender = ahora
+                self.estado = "piston_extiende"
+
+                print("GPIO: banda detenida.")
+                print(f"GPIO: piston extendiendo por {self.tiempo_extender:.2f} segundos.")
+
+        elif self.estado == "piston_extiende":
+            if ahora - self.t_extender >= self.tiempo_extender:
+                self.piston.detener(freno=self.freno_piston)
+
+                self.t_pausa = ahora
+                self.estado = "piston_pausa"
+
+                print("GPIO: piston detenido despues de extender.")
+
+        elif self.estado == "piston_pausa":
+            if ahora - self.t_pausa >= self.pausa_extendido:
+                self.piston.mover(-1)
+
+                self.t_retraer = ahora
+                self.estado = "piston_retrae"
+
+                print(f"GPIO: piston retrayendo por {self.tiempo_retraer:.2f} segundos.")
+
+        elif self.estado == "piston_retrae":
+            if ahora - self.t_retraer >= self.tiempo_retraer:
+                self.piston.detener(freno=self.freno_piston)
+
+                self.t_rearme = ahora
+                self.estado = "rearme"
+
+                print("GPIO: piston detenido despues de retraer.")
+                print(f"GPIO: esperando rearme {self.tiempo_rearme:.2f} segundos.")
+
+        elif self.estado == "rearme":
+            if ahora - self.t_rearme >= self.tiempo_rearme:
+                self.ultimo_disparo = ahora
+
+                if self.reanudar:
+                    self.banda.mover(1)
+                    self.estado = "corriendo"
+                    print("GPIO: banda reanudada.")
+                else:
+                    self.banda.detener(freno=self.freno_banda)
+                    self.estado = "detenido"
+                    print("GPIO: banda queda detenida.")
+
+    def apagar(self):
+        print("GPIO: apagando motores.")
+
+        try:
+            self.piston.apagar()
+        except Exception:
+            pass
+
+        try:
+            self.banda.apagar()
+        except Exception:
+            pass
+
+
+def parse_roi(texto):
+    """
+    ROI en formato x,y,w,h
+    Ejemplo:
+    --roi 80,120,480,250
+    """
+
+    if texto is None or texto.strip() == "":
+        return None
+
+    try:
+        partes = texto.split(",")
+
+        if len(partes) != 4:
+            raise ValueError
+
+        x, y, w, h = [int(v.strip()) for v in partes]
+
+    except Exception:
+        raise argparse.ArgumentTypeError("La ROI debe tener formato x,y,w,h")
+
+    if w <= 0 or h <= 0:
+        raise argparse.ArgumentTypeError("La ROI debe tener ancho y alto positivos")
+
+    return x, y, w, h
+
+
+def ventana_cerrada(nombre):
+    try:
+        return cv2.getWindowProperty(nombre, cv2.WND_PROP_VISIBLE) < 1
+    except cv2.error:
+        return True
+
+
+def aplicar_controles(picam2, controles):
+    if controles is None:
+        return True
+
+    try:
+        picam2.set_controls(controles)
+        return True
+    except Exception as e:
+        print("ADVERTENCIA: no se pudieron aplicar todos los controles de camara.")
+        print("Detalle:", e)
+        return False
+
+
+def iniciar_camara(width, height, controles=None, warmup=2.0):
+    """
+    Este script mantiene el mismo flujo que tu bypass:
+    frame directo de Picamera2 -> OpenCV.
+
+    No se usa RGB2BGR para mostrar ni guardar.
+    """
+
+    picam2 = Picamera2()
+
+    config = picam2.create_preview_configuration(
+        main={
+            "size": (width, height),
+            "format": "RGB888"
+        }
+    )
+
+    picam2.configure(config)
+
+    if controles is not None:
+        aplicar_controles(picam2, controles)
+
+    picam2.start()
+
+    if warmup > 0:
+        time.sleep(warmup)
+
+    return picam2
+
+
+def bloquear_color_actual(picam2):
+    """
+    Fija exposicion, ganancia y balance de blancos actuales.
+    Esto ayuda a que calibracion y deteccion mantengan la misma tonalidad.
+    """
+
+    metadata = picam2.capture_metadata()
+
+    exposure_time = int(metadata.get("ExposureTime", 10000))
+    analogue_gain = float(metadata.get("AnalogueGain", 1.0))
+    colour_gains = metadata.get("ColourGains", (1.0, 1.0))
+
+    if colour_gains is None:
+        colour_gains = (1.0, 1.0)
+
+    colour_gains = (
+        float(colour_gains[0]),
+        float(colour_gains[1])
+    )
+
+    controles = {
+        "AeEnable": False,
+        "AwbEnable": False,
+        "ExposureTime": exposure_time,
+        "AnalogueGain": analogue_gain,
+        "ColourGains": colour_gains
+    }
+
+    ok = aplicar_controles(picam2, controles)
+
+    time.sleep(0.5)
+
+    print("")
+    print("Color/exposicion bloqueados:")
+    print("ExposureTime:", exposure_time)
+    print("AnalogueGain:", analogue_gain)
+    print("ColourGains:", colour_gains)
+    print("Bloqueo aplicado:", ok)
+    print("")
+
+    return exposure_time, analogue_gain, colour_gains, ok
+
+
+def cargar_controles_desde_modelo(modelo):
+    requeridas = [
+        "exposure_time",
+        "analogue_gain",
+        "colour_gains",
+        "color_bloqueado"
+    ]
+
+    if not all(k in modelo.files for k in requeridas):
+        print("El modelo no tiene controles de color guardados.")
+        return None
+
+    color_bloqueado = bool(modelo["color_bloqueado"].item())
+
+    if not color_bloqueado:
+        print("El modelo existe, pero no tiene bloqueo de color valido.")
+        return None
+
+    exposure_time = int(modelo["exposure_time"])
+    analogue_gain = float(modelo["analogue_gain"])
+    colour_gains = tuple(float(x) for x in modelo["colour_gains"])
+
+    controles = {
+        "AeEnable": False,
+        "AwbEnable": False,
+        "ExposureTime": exposure_time,
+        "AnalogueGain": analogue_gain,
+        "ColourGains": colour_gains
+    }
+
+    print("")
+    print("Usando color/exposicion guardados en el modelo:")
+    print("ExposureTime:", exposure_time)
+    print("AnalogueGain:", analogue_gain)
+    print("ColourGains:", colour_gains)
+    print("")
+
+    return controles
+
+
+def recortar_roi(frame, roi):
+    if roi is None:
+        return frame, 0, 0
+
+    alto, ancho = frame.shape[:2]
+
+    x, y, w, h = roi
+
+    x = max(0, min(x, ancho - 1))
+    y = max(0, min(y, alto - 1))
+
+    x2 = max(x + 1, min(x + w, ancho))
+    y2 = max(y + 1, min(y + h, alto))
+
+    return frame[y:y2, x:x2], x, y
+
+
+def mascara_maiz(frame_bgr, expandir=0, todo_roi=False):
+    """
+    Crea una mascara aproximada de la zona con maiz.
+    Trabaja en BGR para mantener consistencia con OpenCV.
+    """
+
+    if todo_roi:
+        h, w = frame_bgr.shape[:2]
+        return np.ones((h, w), dtype=np.uint8) * 255
+
+    lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB)
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+
+    L = lab[:, :, 0]
+    V = hsv[:, :, 2]
+
+    mask = ((L > 60) & (V > 70)).astype(np.uint8) * 255
+
+    kernel = np.ones((3, 3), np.uint8)
+
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+
+    if expandir > 0:
+        mask = cv2.dilate(mask, kernel, iterations=expandir)
+
+    return mask
+
+
+def extraer_features_lab(frame_bgr):
+    lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB)
+    return lab.astype(np.float32)
+
+
+def mahalanobis_map(features, mean, inv_cov):
+    diff = features - mean.reshape((1, 1, 3))
+    d2 = np.einsum("...i,ij,...j->...", diff, inv_cov, diff)
+    return np.maximum(d2, 0)
+
+
+def calibrar(args):
+    print("")
+    print("MODO CALIBRACION")
+    print("Pasa SOLO maiz peto bueno/limpio frente a la camara.")
+    print("q = terminar calibracion | X = cerrar ventana")
+    print("")
+
+    picam2 = iniciar_camara(
+        args.width,
+        args.height,
+        controles=None,
+        warmup=args.warmup
+    )
+
+    exposure_time = 0
+    analogue_gain = 0.0
+    colour_gains = (1.0, 1.0)
+    color_bloqueado = False
+
+    if not args.no_bloquear_color:
+        exposure_time, analogue_gain, colour_gains, color_bloqueado = bloquear_color_actual(picam2)
+
+    muestras = []
+
+    if not args.sin_gui:
+        cv2.namedWindow(VENTANA, cv2.WINDOW_NORMAL)
+
+    try:
+        for i in range(args.frames):
+            frame_bgr = picam2.capture_array()
+
+            roi_img, _, _ = recortar_roi(frame_bgr, args.roi)
+
+            mask = mascara_maiz(
+                roi_img,
+                expandir=0,
+                todo_roi=args.todo_roi
+            )
+
+            features = extraer_features_lab(roi_img)
+
+            pixeles = features[mask > 0]
+
+            if len(pixeles) > 0:
+                pixeles = pixeles[::args.sample_step]
+                muestras.append(pixeles)
+
+            if not args.sin_gui:
+                vis = roi_img.copy()
+
+                texto = f"Calibrando {i + 1}/{args.frames}"
+
+                cv2.putText(
+                    vis,
+                    texto,
+                    (20, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 255),
+                    2
+                )
+
+                cv2.imshow(VENTANA, vis)
+
+                if args.debug:
+                    cv2.imshow("Mascara usada para calibrar", mask)
+
+                tecla = cv2.waitKey(1) & 0xFF
+
+                if tecla == ord("q"):
+                    print("Calibracion detenida por usuario.")
+                    break
+
+                if ventana_cerrada(VENTANA):
+                    print("Ventana cerrada.")
+                    break
+
+            time.sleep(0.02)
+
+    finally:
+        picam2.stop()
+        cv2.destroyAllWindows()
+
+    if len(muestras) == 0:
+        print("ERROR: no se pudieron tomar muestras del maiz.")
+        return
+
+    data = np.vstack(muestras).astype(np.float32)
+
+    if len(data) < 100:
+        print("ERROR: muy pocas muestras para calibrar.")
+        print("Muestras obtenidas:", len(data))
+        return
+
+    if len(data) > args.max_samples:
+        rng = np.random.default_rng(1234)
+        idx = rng.choice(len(data), size=args.max_samples, replace=False)
+        data = data[idx]
+
+    mean = data.mean(axis=0)
+
+    cov = np.cov(data, rowvar=False)
+    cov = cov + np.eye(3) * args.reg
+
+    inv_cov = np.linalg.pinv(cov)
+
+    diff = data - mean
+    d2 = np.einsum("ij,jk,ik->i", diff, inv_cov, diff)
+    d2 = np.maximum(d2, 0)
+
+    threshold = np.percentile(d2, args.percentil)
+
+    np.savez(
+        args.modelo,
+        mean=mean,
+        inv_cov=inv_cov,
+        threshold=threshold,
+        percentil=args.percentil,
+        exposure_time=exposure_time,
+        analogue_gain=analogue_gain,
+        colour_gains=np.array(colour_gains, dtype=np.float32),
+        color_bloqueado=np.array(color_bloqueado, dtype=bool)
+    )
+
+    print("")
+    print("Modelo guardado correctamente:", args.modelo)
+    print("Media LAB aprendida:", mean)
+    print("Umbral base:", threshold)
+    print("Color bloqueado:", color_bloqueado)
+    print("")
+
+
+def detectar(args):
+    control_gpio = None
+    picam2 = None
+
+    if not os.path.exists(args.modelo):
+        print("ERROR: no existe el modelo.")
+        print(f"Primero calibra con: python3 detector_maiz_ia.py calibrar --modelo {args.modelo}")
+        return
+
+    modelo = np.load(args.modelo)
+
+    mean = modelo["mean"].astype(np.float32)
+    inv_cov = modelo["inv_cov"].astype(np.float32)
+
+    threshold_base = float(modelo["threshold"])
+    threshold = threshold_base * args.tolerancia
+
+    controles_camara = None
+
+    if not args.no_bloquear_color:
+        controles_camara = cargar_controles_desde_modelo(modelo)
+
+    print("")
+    print("MODO DETECCION")
+    print("Modelo cargado:", args.modelo)
+    print("Umbral base:", threshold_base)
+    print("Tolerancia:", args.tolerancia)
+    print("Umbral usado:", threshold)
+    print("q = salir | s = guardar captura | X = cerrar ventana")
+    print("")
+
+    try:
+        picam2 = iniciar_camara(
+            args.width,
+            args.height,
+            controles=controles_camara,
+            warmup=1.0
+        )
+
+        if args.gpio:
+            banda_en = None if args.banda_sin_en else args.banda_en
+            piston_en = None if args.piston_sin_en else args.piston_en
+
+            control_gpio = ControlActuadoresHBridge(
+                banda_in1=args.banda_in1,
+                banda_in2=args.banda_in2,
+                banda_en=banda_en,
+                piston_in1=args.piston_in1,
+                piston_in2=args.piston_in2,
+                piston_en=piston_en,
+                velocidad_banda=args.velocidad_banda,
+                velocidad_piston=args.velocidad_piston,
+                banda_invertir=args.banda_invertir,
+                piston_invertir=args.piston_invertir,
+                banda_en_active_high=not args.banda_en_activo_bajo,
+                piston_en_active_high=not args.piston_en_activo_bajo,
+                retardo_rechazo=args.retardo_rechazo,
+                tiempo_extender=args.tiempo_extender,
+                pausa_extendido=args.pausa_extendido,
+                tiempo_retraer=args.tiempo_retraer,
+                tiempo_rearme=args.tiempo_rearme,
+                cooldown=args.cooldown_rechazo,
+                reanudar=not args.no_reanudar_banda,
+                freno_banda=args.freno_banda,
+                freno_piston=args.freno_piston
+            )
+
+            control_gpio.iniciar_banda()
+
+        if not args.sin_gui:
+            cv2.namedWindow(VENTANA, cv2.WINDOW_NORMAL)
+
+        kernel = np.ones((3, 3), np.uint8)
+
+        ultima_captura_auto = 0.0
+
+        while True:
+            frame_bgr = picam2.capture_array()
+
+            roi_img, _, _ = recortar_roi(frame_bgr, args.roi)
+
+            mask_zona = mascara_maiz(
+                roi_img,
+                expandir=args.expandir_mascara,
+                todo_roi=args.todo_roi
+            )
+
+            features = extraer_features_lab(roi_img)
+
+            d2 = mahalanobis_map(features, mean, inv_cov)
+
+            anomalia = ((d2 > threshold) & (mask_zona > 0)).astype(np.uint8) * 255
+
+            anomalia = cv2.morphologyEx(
+                anomalia,
+                cv2.MORPH_OPEN,
+                kernel,
+                iterations=1
+            )
+
+            anomalia = cv2.dilate(
+                anomalia,
+                kernel,
+                iterations=1
+            )
+
+            contornos, _ = cv2.findContours(
+                anomalia,
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE
+            )
+
+            cajas = []
+
+            for cnt in contornos:
+                area = cv2.contourArea(cnt)
+
+                if area >= args.min_area:
+                    x, y, w, h = cv2.boundingRect(cnt)
+                    cajas.append((x, y, w, h, area))
+
+            vis = roi_img.copy()
+
+            for x, y, w, h, area in cajas:
+                cv2.rectangle(
+                    vis,
+                    (x, y),
+                    (x + w, y + h),
+                    (0, 0, 255),
+                    2
+                )
+
+                cv2.putText(
+                    vis,
+                    str(int(area)),
+                    (x, max(20, y - 5)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 0, 255),
+                    1
+                )
+
+            pixeles_maiz = max(np.count_nonzero(mask_zona), 1)
+            pixeles_anomalia = np.count_nonzero(anomalia)
+
+            porcentaje = 100.0 * pixeles_anomalia / pixeles_maiz
+
+            hay_alerta = len(cajas) > 0 or porcentaje >= args.alerta_pct
+
+            if control_gpio is not None:
+                if hay_alerta:
+                    control_gpio.registrar_alerta()
+
+                control_gpio.actualizar()
+
+            if hay_alerta:
+                estado = f"ALERTA: {len(cajas)} zona(s) - {porcentaje:.2f}%"
+                color_estado = (0, 0, 255)
+            else:
+                estado = f"OK - {porcentaje:.2f}%"
+                color_estado = (0, 255, 0)
+
+            cv2.putText(
+                vis,
+                estado,
+                (20, 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                color_estado,
+                2
+            )
+
+            if control_gpio is not None:
+                cv2.putText(
+                    vis,
+                    "GPIO: " + control_gpio.estado,
+                    (20, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 255, 0),
+                    2
+                )
+
+            if hay_alerta and args.auto_save:
+                ahora = time.time()
+
+                if ahora - ultima_captura_auto >= args.cooldown:
+                    nombre = "anomalia_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".jpg"
+                    cv2.imwrite(nombre, vis)
+                    print("Captura automatica guardada:", nombre)
+                    ultima_captura_auto = ahora
+
+            if args.sin_gui:
+                if hay_alerta:
+                    print(estado)
+
+                time.sleep(0.05)
+                continue
+
+            cv2.imshow(VENTANA, vis)
+
+            if args.debug:
+                cv2.imshow("Mascara anomalias", anomalia)
+                cv2.imshow("Mascara zona inspeccion", mask_zona)
+
+            tecla = cv2.waitKey(1) & 0xFF
+
+            if tecla == ord("q"):
+                print("Saliendo...")
+                break
+
+            if tecla == ord("s"):
+                nombre = "captura_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".jpg"
+                cv2.imwrite(nombre, vis)
+                print("Captura guardada:", nombre)
+
+            if ventana_cerrada(VENTANA):
+                print("Ventana cerrada.")
+                break
+
+    except KeyboardInterrupt:
+        print("Proceso detenido con Ctrl+C.")
+
+    finally:
+        if control_gpio is not None:
+            control_gpio.apagar()
+
+        if picam2 is not None:
+            try:
+                picam2.stop()
+            except Exception:
+                pass
+
+        cv2.destroyAllWindows()
+        print("Proceso terminado.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Detector IA ligero de impurezas/anomalias en maiz peto con OpenCV, Picamera2 y dos puentes H."
+    )
+
+    parser.add_argument(
+        "modo",
+        choices=["calibrar", "detectar"],
+        help="calibrar = aprender maiz bueno; detectar = buscar anomalias"
+    )
+
+    parser.add_argument("--modelo", default=MODELO_DEFAULT)
+
+    parser.add_argument("--width", type=int, default=640)
+    parser.add_argument("--height", type=int, default=480)
+
+    parser.add_argument(
+        "--roi",
+        type=parse_roi,
+        default=None,
+        help="Zona de inspeccion x,y,w,h. Ejemplo: --roi 80,120,480,250"
+    )
+
+    parser.add_argument(
+        "--sin-gui",
+        action="store_true",
+        help="Ejecutar sin ventanas graficas."
+    )
+
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Muestra mascaras internas para ajustar el detector."
+    )
+
+    parser.add_argument(
+        "--no-bloquear-color",
+        action="store_true",
+        help="No fija exposicion ni balance de blancos."
+    )
+
+    parser.add_argument(
+        "--warmup",
+        type=float,
+        default=2.0,
+        help="Tiempo inicial para estabilizar camara en segundos."
+    )
+
+    # Parametros de calibracion
+    parser.add_argument("--frames", type=int, default=100)
+    parser.add_argument("--sample-step", type=int, default=5)
+    parser.add_argument("--max-samples", type=int, default=200000)
+    parser.add_argument("--percentil", type=float, default=99.5)
+    parser.add_argument("--reg", type=float, default=15.0)
+
+    # Parametros de deteccion
+    parser.add_argument(
+        "--tolerancia",
+        type=float,
+        default=1.25,
+        help="Mayor valor = menos sensible. Menor valor = mas sensible."
+    )
+
+    parser.add_argument(
+        "--min-area",
+        type=float,
+        default=80,
+        help="Area minima de una anomalia para marcarla."
+    )
+
+    parser.add_argument(
+        "--alerta-pct",
+        type=float,
+        default=0.4,
+        help="Porcentaje de pixeles anomalos para alerta."
+    )
+
+    parser.add_argument(
+        "--expandir-mascara",
+        type=int,
+        default=2,
+        help="Expande la zona de maiz para incluir manchas oscuras cercanas."
+    )
+
+    parser.add_argument(
+        "--todo-roi",
+        action="store_true",
+        help="Usa toda la ROI como zona de inspeccion."
+    )
+
+    parser.add_argument(
+        "--auto-save",
+        action="store_true",
+        help="Guarda imagenes automaticamente cuando detecta anomalias."
+    )
+
+    parser.add_argument(
+        "--cooldown",
+        type=float,
+        default=2.0,
+        help="Tiempo minimo entre capturas automaticas."
+    )
+
+    # GPIO / Puentes H
+    parser.add_argument(
+        "--gpio",
+        action="store_true",
+        help="Activa control GPIO para banda y piston con puentes H."
+    )
+
+    parser.add_argument(
+        "--banda-in1",
+        type=int,
+        default=17,
+        help="GPIO BCM conectado a IN1 del puente H de la banda."
+    )
+
+    parser.add_argument(
+        "--banda-in2",
+        type=int,
+        default=27,
+        help="GPIO BCM conectado a IN2 del puente H de la banda."
+    )
+
+    parser.add_argument(
+        "--banda-en",
+        type=int,
+        default=22,
+        help="GPIO BCM conectado a EN/PWM del puente H de la banda."
+    )
+
+    parser.add_argument(
+        "--banda-sin-en",
+        action="store_true",
+        help="Usar si el EN de banda esta puenteado o no se controla desde GPIO."
+    )
+
+    parser.add_argument(
+        "--banda-invertir",
+        action="store_true",
+        help="Invierte el sentido del motor de la banda."
+    )
+
+    parser.add_argument(
+        "--banda-en-activo-bajo",
+        action="store_true",
+        help="Usar si EN de banda se activa con LOW."
+    )
+
+    parser.add_argument(
+        "--velocidad-banda",
+        type=float,
+        default=1.0,
+        help="Velocidad PWM de banda entre 0.0 y 1.0 si se usa EN."
+    )
+
+    parser.add_argument(
+        "--piston-in1",
+        type=int,
+        default=5,
+        help="GPIO BCM conectado a IN1 del puente H del piston."
+    )
+
+    parser.add_argument(
+        "--piston-in2",
+        type=int,
+        default=6,
+        help="GPIO BCM conectado a IN2 del puente H del piston."
+    )
+
+    parser.add_argument(
+        "--piston-en",
+        type=int,
+        default=13,
+        help="GPIO BCM conectado a EN/PWM del puente H del piston."
+    )
+
+    parser.add_argument(
+        "--piston-sin-en",
+        action="store_true",
+        help="Usar si el EN del piston esta puenteado o no se controla desde GPIO."
+    )
+
+    parser.add_argument(
+        "--piston-invertir",
+        action="store_true",
+        help="Invierte extension/retraccion del piston."
+    )
+
+    parser.add_argument(
+        "--piston-en-activo-bajo",
+        action="store_true",
+        help="Usar si EN del piston se activa con LOW."
+    )
+
+    parser.add_argument(
+        "--velocidad-piston",
+        type=float,
+        default=1.0,
+        help="Velocidad PWM del piston entre 0.0 y 1.0 si se usa EN."
+    )
+
+    parser.add_argument(
+        "--retardo-rechazo",
+        type=float,
+        default=2.0,
+        help="Tiempo desde alerta hasta detener banda y accionar piston."
+    )
+
+    parser.add_argument(
+        "--tiempo-extender",
+        type=float,
+        default=0.7,
+        help="Tiempo que el motor del piston gira para extender."
+    )
+
+    parser.add_argument(
+        "--pausa-extendido",
+        type=float,
+        default=0.1,
+        help="Pausa despues de extender antes de retraer."
+    )
+
+    parser.add_argument(
+        "--tiempo-retraer",
+        type=float,
+        default=0.7,
+        help="Tiempo que el motor del piston gira para retraer."
+    )
+
+    parser.add_argument(
+        "--tiempo-rearme",
+        type=float,
+        default=1.0,
+        help="Tiempo antes de volver a encender la banda."
+    )
+
+    parser.add_argument(
+        "--cooldown-rechazo",
+        type=float,
+        default=3.0,
+        help="Tiempo minimo entre dos activaciones del piston."
+    )
+
+    parser.add_argument(
+        "--no-reanudar-banda",
+        action="store_true",
+        help="Deja la banda detenida despues de accionar el piston."
+    )
+
+    parser.add_argument(
+        "--freno-banda",
+        action="store_true",
+        help="Usa freno electrico al detener la banda."
+    )
+
+    parser.add_argument(
+        "--freno-piston",
+        action="store_true",
+        help="Usa freno electrico al detener el motor del piston."
+    )
+
+    args = parser.parse_args()
+
+    if args.modo == "calibrar":
+        calibrar(args)
+
+    elif args.modo == "detectar":
+        detectar(args)
+
+
+if __name__ == "__main__":
+    main()
